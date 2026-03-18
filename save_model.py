@@ -8,6 +8,9 @@ import numpy as np
 import re
 import math
 import warnings
+import urllib.request
+import zipfile
+import io
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -20,42 +23,48 @@ warnings.filterwarnings('ignore')
 # ── Download Dataset Automatically ───────────────────────────
 print("Downloading dataset...")
 
-url = "https://raw.githubusercontent.com/varma916/reddit-news-recommender/main/worldnews.csv"
-
 try:
-    df = pd.read_csv(url)
-    print(f"✅ Dataset loaded from URL! Shape: {df.shape}")
-except:
-    print("URL failed — trying backup...")
-    url2 = "https://raw.githubusercontent.com/rmisra/news-category-dataset/master/News_Category_Dataset_v3.json"
-    df   = pd.read_json(url2, lines=True)
-    df   = df.rename(columns={
-        'headline'  : 'title',
-        'category'  : 'subreddit',
-        'date'      : 'date_created'
+    url      = "https://archive.ics.uci.edu/ml/machine-learning-databases/00359/NewsAggregatorDataset.zip"
+    response = urllib.request.urlopen(url)
+    zip_data = zipfile.ZipFile(io.BytesIO(response.read()))
+    zip_data.extractall('/tmp/')
+
+    df = pd.read_csv('/tmp/newsCorpora.csv', sep='\t', header=None,
+                     names=['id','title','url','publisher',
+                            'category','story','hostname','timestamp'])
+
+    df['subreddit'] = df['category'].map({
+        'b': 'business',
+        't': 'technology',
+        'e': 'entertainment',
+        'm': 'health'
     })
+
+    np.random.seed(42)
     df['score']        = np.random.randint(1, 5000, size=len(df))
     df['num_comments'] = np.random.randint(0, 1000, size=len(df))
-    df['timestamp']    = pd.to_datetime(
-        df['date_created']).astype(np.int64) // 10**9
-    print(f"✅ Backup dataset loaded! Shape: {df.shape}")
+    df['timestamp']    = np.random.randint(
+        1000000000, 1500000000, size=len(df))
 
-# ── Rename Columns ────────────────────────────────────────────
-df = df.rename(columns={
-    'up_votes'    : 'score',
-    'down_votes'  : 'num_comments',
-    'time_created': 'timestamp'
-})
+    print(f"✅ Dataset loaded! Shape: {df.shape}")
 
-# Fill missing columns if needed
+except Exception as e:
+    print(f"Dataset download failed: {e}")
+    raise
+
+
+# ── Fill Missing Columns ──────────────────────────────────────
 if 'score' not in df.columns:
     df['score'] = np.random.randint(1, 5000, size=len(df))
 if 'num_comments' not in df.columns:
     df['num_comments'] = np.random.randint(0, 1000, size=len(df))
 if 'timestamp' not in df.columns:
     df['timestamp'] = 1000000000
+if 'subreddit' not in df.columns:
+    df['subreddit'] = 'general'
 
-# Sample 20000 rows
+
+# ── Sample 20000 Rows ─────────────────────────────────────────
 if len(df) > 20000:
     df = df.sample(n=20000, random_state=42).reset_index(drop=True)
 
