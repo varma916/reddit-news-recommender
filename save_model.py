@@ -1,5 +1,6 @@
 # save_model.py
 # Downloads dataset and trains model automatically on Render
+# Optimized for Render free tier (512MB RAM)
 
 import os
 import pickle
@@ -11,9 +12,9 @@ import warnings
 import urllib.request
 import zipfile
 import io
+import scipy.sparse as sp
 
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.decomposition import TruncatedSVD
 
@@ -64,9 +65,11 @@ if 'subreddit' not in df.columns:
     df['subreddit'] = 'general'
 
 
-# ── Sample 20000 Rows ─────────────────────────────────────────
-if len(df) > 5000:
-    df = df.sample(n=5000, random_state=42).reset_index(drop=True)
+# ── Sample ONLY 3000 Rows for RAM efficiency ─────────────────
+# Free tier has 512MB RAM
+# 3000 rows cosine matrix = 3000x3000 = ~72MB — safe!
+if len(df) > 3000:
+    df = df.sample(n=3000, random_state=42).reset_index(drop=True)
 
 print(f"Dataset shape after sampling: {df.shape}")
 
@@ -149,7 +152,7 @@ print("Feature engineering done!")
 # ── Build TF-IDF Matrix ───────────────────────────────────────
 print("Building TF-IDF matrix...")
 tfidf = TfidfVectorizer(
-    max_features = 5000,
+    max_features = 3000,
     ngram_range  = (1, 2),
     min_df       = 2,
     max_df       = 0.95,
@@ -159,35 +162,38 @@ tfidf_matrix = tfidf.fit_transform(df['clean_title'])
 print(f"TF-IDF Matrix Shape: {tfidf_matrix.shape}")
 
 
-# ── Build Cosine Similarity Matrix ────────────────────────────
-print("Building cosine similarity matrix...")
-cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
-print(f"Cosine Similarity Shape: {cosine_sim.shape}")
-
-
 # ── Build SVD Matrix ──────────────────────────────────────────
+# SVD reduces dimensions — much smaller than full cosine matrix
 print("Building SVD matrix...")
-svd            = TruncatedSVD(n_components=100, random_state=42)
+n_components   = 50
+svd            = TruncatedSVD(n_components=n_components,
+                               random_state=42)
 svd_matrix     = svd.fit_transform(tfidf_matrix)
-svd_cosine_sim = cosine_similarity(svd_matrix, svd_matrix)
 print(f"SVD Matrix Shape: {svd_matrix.shape}")
 print(f"SVD Variance Captured: {svd.explained_variance_ratio_.sum()*100:.1f}%")
 
 
 # ── Save All Models ───────────────────────────────────────────
+# We save tfidf_matrix as sparse (small file)
+# We do NOT save full cosine_sim matrix (too large)
+# Instead main.py computes similarity on demand for each query
+
 print("\nSaving all models...")
 save_path = os.path.dirname(os.path.abspath(__file__))
 
+# Save dataframe
 df.to_pickle(os.path.join(save_path, 'df.pkl'))
 
-with open(os.path.join(save_path, 'cosine_sim.pkl'), 'wb') as f:
-    pickle.dump(cosine_sim, f)
-
-with open(os.path.join(save_path, 'svd_cosine_sim.pkl'), 'wb') as f:
-    pickle.dump(svd_cosine_sim, f)
-
+# Save tfidf vectorizer
 with open(os.path.join(save_path, 'tfidf.pkl'), 'wb') as f:
     pickle.dump(tfidf, f)
+
+# Save sparse tfidf matrix (very small file)
+sp.save_npz(os.path.join(save_path, 'tfidf_matrix.npz'),
+            tfidf_matrix)
+
+# Save SVD matrix (small — only 3000 x 50)
+np.save(os.path.join(save_path, 'svd_matrix.npy'), svd_matrix)
 
 print("\n✅ All models saved successfully!")
 print(f"Saved to: {save_path}")

@@ -1,49 +1,55 @@
 # main.py — FastAPI Backend
-# Loads saved model and serves recommendations via API
-# Now with Live News API integration
+# Optimized for Render free tier
+# Computes similarity on demand instead of loading full matrix
 
 import os
 import pickle
 import subprocess
 import pandas as pd
 import numpy as np
+import scipy.sparse as sp
 import requests as req
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-
-# ── Load News API Key from Environment ───────────────────────
-NEWS_API_KEY = os.getenv('NEWS_API_KEY', '')
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ── Load saved models ─────────────────────────────────────────
 MODEL_PATH = os.path.dirname(os.path.abspath(__file__))
 
-print("Loading models...")
-try:
-    df             = pd.read_pickle(
-        os.path.join(MODEL_PATH, 'df.pkl'))
-    cosine_sim     = pickle.load(open(
-        os.path.join(MODEL_PATH, 'cosine_sim.pkl'), 'rb'))
-    svd_cosine_sim = pickle.load(open(
-        os.path.join(MODEL_PATH, 'svd_cosine_sim.pkl'), 'rb'))
-    print("✅ Models loaded successfully!")
+def load_models():
+    global df, tfidf_matrix, svd_matrix
+    print("Loading models...")
+    try:
+        df          = pd.read_pickle(
+            os.path.join(MODEL_PATH, 'df.pkl'))
+        tfidf_matrix = sp.load_npz(
+            os.path.join(MODEL_PATH, 'tfidf_matrix.npz'))
+        svd_matrix  = np.load(
+            os.path.join(MODEL_PATH, 'svd_matrix.npy'))
+        print("✅ Models loaded successfully!")
 
-except Exception as e:
-    print(f"Models not found: {e}")
-    print("Running save_model.py to generate models...")
-    subprocess.run(
-        ['python', os.path.join(MODEL_PATH, 'save_model.py')],
-        check=True
-    )
-    df             = pd.read_pickle(
-        os.path.join(MODEL_PATH, 'df.pkl'))
-    cosine_sim     = pickle.load(open(
-        os.path.join(MODEL_PATH, 'cosine_sim.pkl'), 'rb'))
-    svd_cosine_sim = pickle.load(open(
-        os.path.join(MODEL_PATH, 'svd_cosine_sim.pkl'), 'rb'))
-    print("✅ Models loaded after regeneration!")
+    except Exception as e:
+        print(f"Models not found: {e}")
+        print("Running save_model.py...")
+        subprocess.run(
+            ['python',
+             os.path.join(MODEL_PATH, 'save_model.py')],
+            check=True
+        )
+        df           = pd.read_pickle(
+            os.path.join(MODEL_PATH, 'df.pkl'))
+        tfidf_matrix = sp.load_npz(
+            os.path.join(MODEL_PATH, 'tfidf_matrix.npz'))
+        svd_matrix   = np.load(
+            os.path.join(MODEL_PATH, 'svd_matrix.npy'))
+        print("✅ Models loaded after regeneration!")
 
+load_models()
+
+# ── Load API Key ──────────────────────────────────────────────
+NEWS_API_KEY = os.getenv('NEWS_API_KEY', '')
 
 # ── FastAPI App ───────────────────────────────────────────────
 app = FastAPI(
@@ -69,40 +75,46 @@ class RecommendRequest(BaseModel):
 
 
 # ── Helper Functions ──────────────────────────────────────────
-def content_based_recommend(post_title, top_n=10):
+def get_post_index(post_title):
     matches = df[df['title'].str.contains(
         post_title, case=False, na=False)]
     if matches.empty:
+        return None
+    return matches.index[0]
+
+
+def content_based_recommend(post_title, top_n=10):
+    idx = get_post_index(post_title)
+    if idx is None:
         return []
-    idx        = matches.index[0]
-    sim_scores = list(enumerate(cosine_sim[idx]))
-    sim_scores = sorted(sim_scores,
-                        key=lambda x: x[1], reverse=True)
-    sim_scores = sim_scores[1:top_n+1]
-    indices    = [i[0] for i in sim_scores]
-    similarity = [i[1] for i in sim_scores]
-    result     = df.iloc[indices][
+
+    # Compute similarity only for this one query row
+    query_vec  = tfidf_matrix[idx]
+    sim_scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
+    sim_scores[idx] = 0  # remove self
+    top_indices = sim_scores.argsort()[::-1][:top_n]
+
+    result = df.iloc[top_indices][
         ['title','subreddit','score','num_comments']].copy()
-    result['score_val'] = similarity
+    result['score_val'] = sim_scores[top_indices]
     result['method']    = 'TF-IDF Content'
     return result.to_dict('records')
 
 
 def svd_based_recommend(post_title, top_n=10):
-    matches = df[df['title'].str.contains(
-        post_title, case=False, na=False)]
-    if matches.empty:
+    idx = get_post_index(post_title)
+    if idx is None:
         return []
-    idx        = matches.index[0]
-    sim_scores = list(enumerate(svd_cosine_sim[idx]))
-    sim_scores = sorted(sim_scores,
-                        key=lambda x: x[1], reverse=True)
-    sim_scores = sim_scores[1:top_n+1]
-    indices    = [i[0] for i in sim_scores]
-    similarity = [i[1] for i in sim_scores]
-    result     = df.iloc[indices][
+
+    # Compute SVD similarity only for this one query row
+    query_vec  = svd_matrix[idx].reshape(1, -1)
+    sim_scores = cosine_similarity(query_vec, svd_matrix).flatten()
+    sim_scores[idx] = 0  # remove self
+    top_indices = sim_scores.argsort()[::-1][:top_n]
+
+    result = df.iloc[top_indices][
         ['title','subreddit','score','num_comments']].copy()
-    result['score_val'] = similarity
+    result['score_val'] = sim_scores[top_indices]
     result['method']    = 'SVD'
     return result.to_dict('records')
 
@@ -121,57 +133,45 @@ def popularity_based_recommend(subreddit=None, top_n=10):
 
 
 def hybrid_recommend(post_title, top_n=10):
-    matches = df[df['title'].str.contains(
-        post_title, case=False, na=False)]
-    if matches.empty:
+    idx = get_post_index(post_title)
+    if idx is None:
         return []
-    idx = matches.index[0]
 
-    tfidf_scores = list(enumerate(cosine_sim[idx]))
-    tfidf_scores = sorted(tfidf_scores,
-                          key=lambda x: x[1],
-                          reverse=True)[1:]
+    # TF-IDF similarity
+    query_tfidf    = tfidf_matrix[idx]
+    tfidf_scores   = cosine_similarity(
+        query_tfidf, tfidf_matrix).flatten()
+    tfidf_scores[idx] = 0
 
-    svd_scores   = list(enumerate(svd_cosine_sim[idx]))
-    svd_scores   = sorted(svd_scores,
-                          key=lambda x: x[1],
-                          reverse=True)[1:]
+    # SVD similarity
+    query_svd      = svd_matrix[idx].reshape(1, -1)
+    svd_scores     = cosine_similarity(
+        query_svd, svd_matrix).flatten()
+    svd_scores[idx] = 0
 
-    indices      = [i[0] for i in tfidf_scores]
-    tfidf_vals   = [i[1] for i in tfidf_scores]
-    svd_vals_map = {i[0]: i[1] for i in svd_scores}
+    # Popularity score
+    pop_scores     = df['hot_score_norm'].values
 
-    result = df.iloc[indices][
-        ['title','subreddit','score',
-         'num_comments','hot_score_norm']].copy()
-    result['content_score']    = tfidf_vals
-    result['svd_score']        = [svd_vals_map.get(i, 0)
-                                   for i in indices]
-    result['popularity_score'] = result['hot_score_norm']
-    result['hybrid_score']     = (
-        0.4 * result['content_score'] +
-        0.3 * result['svd_score'] +
-        0.3 * result['popularity_score']
-    )
-    result      = result.sort_values(
-        'hybrid_score', ascending=False).head(top_n)
-    result['score_val'] = result['hybrid_score']
+    # Weighted hybrid
+    hybrid_scores  = (0.4 * tfidf_scores +
+                      0.3 * svd_scores +
+                      0.3 * pop_scores)
+    hybrid_scores[idx] = 0
+
+    top_indices = hybrid_scores.argsort()[::-1][:top_n]
+
+    result = df.iloc[top_indices][
+        ['title','subreddit','score','num_comments']].copy()
+    result['score_val'] = hybrid_scores[top_indices]
     result['method']    = 'Hybrid'
-    return result[['title','subreddit','score',
-                   'num_comments','score_val',
-                   'method']].to_dict('records')
+    return result.to_dict('records')
 
 
 def get_live_news(query=None, category=None, top_n=10):
-    """
-    Fetches live news from NewsAPI
-    """
     if not NEWS_API_KEY:
         return []
-
     try:
         if query:
-            # Search news by keyword
             url = (
                 f"https://newsapi.org/v2/everything?"
                 f"q={query}&"
@@ -181,8 +181,8 @@ def get_live_news(query=None, category=None, top_n=10):
                 f"apiKey={NEWS_API_KEY}"
             )
         else:
-            # Get top headlines by category
-            cat_param = f"&category={category}" if category else ""
+            cat_param = f"&category={category}" \
+                if category else ""
             url = (
                 f"https://newsapi.org/v2/top-headlines?"
                 f"country=us{cat_param}&"
@@ -198,12 +198,14 @@ def get_live_news(query=None, category=None, top_n=10):
 
         articles = []
         for article in data.get('articles', []):
-            if article.get('title') and article.get('title') != '[Removed]':
+            if article.get('title') and \
+               article.get('title') != '[Removed]':
                 articles.append({
                     'title'      : article.get('title', ''),
                     'description': article.get('description', ''),
                     'url'        : article.get('url', ''),
-                    'source'     : article.get('source', {}).get('name', ''),
+                    'source'     : article.get(
+                        'source', {}).get('name', ''),
                     'published'  : article.get('publishedAt', ''),
                     'subreddit'  : category or 'general',
                     'score'      : 0,
@@ -211,7 +213,6 @@ def get_live_news(query=None, category=None, top_n=10):
                     'score_val'  : 1.0,
                     'method'     : 'Live News'
                 })
-
         return articles
 
     except Exception as e:
@@ -258,25 +259,17 @@ def get_recommendations(request: RecommendRequest):
 @app.get("/live-news")
 def live_news(category: Optional[str] = None,
               top_n: int = 10):
-    """
-    Fetches latest live news headlines from NewsAPI
-    Categories: business, technology, health,
-                science, sports, entertainment
-    """
     results = get_live_news(category=category, top_n=top_n)
     return {
-        "category"    : category or "general",
+        "category"     : category or "general",
         "total_results": len(results),
-        "source"      : "NewsAPI — Live",
-        "articles"    : results
+        "source"       : "NewsAPI — Live",
+        "articles"     : results
     }
 
 
 @app.get("/live-search")
 def live_search(query: str, top_n: int = 10):
-    """
-    Search live news by keyword from NewsAPI
-    """
     results = get_live_news(query=query, top_n=top_n)
     return {
         "query"        : query,
@@ -306,9 +299,10 @@ def get_popular(subreddit: Optional[str] = None,
 @app.get("/stats")
 def get_stats():
     return {
-        "total_posts"   : len(df),
-        "categories"    : df['subreddit'].nunique(),
-        "avg_score"     : round(df['score'].mean(), 2),
-        "avg_comments"  : round(df['num_comments'].mean(), 2),
-        "live_news"     : "✅ Enabled" if NEWS_API_KEY else "❌ No API Key"
+        "total_posts" : len(df),
+        "categories"  : df['subreddit'].nunique(),
+        "avg_score"   : round(df['score'].mean(), 2),
+        "avg_comments": round(df['num_comments'].mean(), 2),
+        "live_news"   : "✅ Enabled"
+                        if NEWS_API_KEY else "❌ No API Key"
     }
