@@ -65,8 +65,8 @@ if 'subreddit' not in df.columns:
 
 
 # ── Sample 20000 Rows ─────────────────────────────────────────
-if len(df) > 20000:
-    df = df.sample(n=20000, random_state=42).reset_index(drop=True)
+if len(df) > 5000:
+    df = df.sample(n=5000, random_state=42).reset_index(drop=True)
 
 print(f"Dataset shape after sampling: {df.shape}")
 
