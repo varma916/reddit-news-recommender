@@ -1,15 +1,20 @@
 # main.py — FastAPI Backend
 # Loads saved model and serves recommendations via API
+# Now with Live News API integration
 
 import os
 import pickle
 import subprocess
 import pandas as pd
 import numpy as np
+import requests as req
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+
+# ── Load News API Key from Environment ───────────────────────
+NEWS_API_KEY = os.getenv('NEWS_API_KEY', '')
 
 # ── Load saved models ─────────────────────────────────────────
 MODEL_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -43,8 +48,8 @@ except Exception as e:
 # ── FastAPI App ───────────────────────────────────────────────
 app = FastAPI(
     title       = "Reddit News Recommendation API",
-    description = "Recommends Reddit news posts using TF-IDF, SVD and Hybrid",
-    version     = "1.0"
+    description = "Recommends news using TF-IDF, SVD, Hybrid and Live News",
+    version     = "2.0"
 )
 
 app.add_middleware(
@@ -148,7 +153,7 @@ def hybrid_recommend(post_title, top_n=10):
         0.3 * result['svd_score'] +
         0.3 * result['popularity_score']
     )
-    result    = result.sort_values(
+    result      = result.sort_values(
         'hybrid_score', ascending=False).head(top_n)
     result['score_val'] = result['hybrid_score']
     result['method']    = 'Hybrid'
@@ -157,13 +162,72 @@ def hybrid_recommend(post_title, top_n=10):
                    'method']].to_dict('records')
 
 
+def get_live_news(query=None, category=None, top_n=10):
+    """
+    Fetches live news from NewsAPI
+    """
+    if not NEWS_API_KEY:
+        return []
+
+    try:
+        if query:
+            # Search news by keyword
+            url = (
+                f"https://newsapi.org/v2/everything?"
+                f"q={query}&"
+                f"sortBy=publishedAt&"
+                f"pageSize={top_n}&"
+                f"language=en&"
+                f"apiKey={NEWS_API_KEY}"
+            )
+        else:
+            # Get top headlines by category
+            cat_param = f"&category={category}" if category else ""
+            url = (
+                f"https://newsapi.org/v2/top-headlines?"
+                f"country=us{cat_param}&"
+                f"pageSize={top_n}&"
+                f"apiKey={NEWS_API_KEY}"
+            )
+
+        response = req.get(url, timeout=10)
+        data     = response.json()
+
+        if data.get('status') != 'ok':
+            return []
+
+        articles = []
+        for article in data.get('articles', []):
+            if article.get('title') and article.get('title') != '[Removed]':
+                articles.append({
+                    'title'      : article.get('title', ''),
+                    'description': article.get('description', ''),
+                    'url'        : article.get('url', ''),
+                    'source'     : article.get('source', {}).get('name', ''),
+                    'published'  : article.get('publishedAt', ''),
+                    'subreddit'  : category or 'general',
+                    'score'      : 0,
+                    'num_comments': 0,
+                    'score_val'  : 1.0,
+                    'method'     : 'Live News'
+                })
+
+        return articles
+
+    except Exception as e:
+        print(f"NewsAPI error: {e}")
+        return []
+
+
 # ── API Routes ────────────────────────────────────────────────
 @app.get("/")
 def home():
     return {
         "message"  : "Reddit News Recommendation API is running!",
+        "version"  : "2.0 — Now with Live News!",
         "endpoints": ["/recommend", "/categories",
-                      "/popular", "/stats"]
+                      "/popular", "/stats",
+                      "/live-news", "/live-search"]
     }
 
 
@@ -191,6 +255,37 @@ def get_recommendations(request: RecommendRequest):
     }
 
 
+@app.get("/live-news")
+def live_news(category: Optional[str] = None,
+              top_n: int = 10):
+    """
+    Fetches latest live news headlines from NewsAPI
+    Categories: business, technology, health,
+                science, sports, entertainment
+    """
+    results = get_live_news(category=category, top_n=top_n)
+    return {
+        "category"    : category or "general",
+        "total_results": len(results),
+        "source"      : "NewsAPI — Live",
+        "articles"    : results
+    }
+
+
+@app.get("/live-search")
+def live_search(query: str, top_n: int = 10):
+    """
+    Search live news by keyword from NewsAPI
+    """
+    results = get_live_news(query=query, top_n=top_n)
+    return {
+        "query"        : query,
+        "total_results": len(results),
+        "source"       : "NewsAPI — Live",
+        "articles"     : results
+    }
+
+
 @app.get("/categories")
 def get_categories():
     counts = df['subreddit'].value_counts().to_dict()
@@ -211,8 +306,9 @@ def get_popular(subreddit: Optional[str] = None,
 @app.get("/stats")
 def get_stats():
     return {
-        "total_posts" : len(df),
-        "categories"  : df['subreddit'].nunique(),
-        "avg_score"   : round(df['score'].mean(), 2),
-        "avg_comments": round(df['num_comments'].mean(), 2)
+        "total_posts"   : len(df),
+        "categories"    : df['subreddit'].nunique(),
+        "avg_score"     : round(df['score'].mean(), 2),
+        "avg_comments"  : round(df['num_comments'].mean(), 2),
+        "live_news"     : "✅ Enabled" if NEWS_API_KEY else "❌ No API Key"
     }
