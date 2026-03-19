@@ -8,7 +8,7 @@ st.set_page_config(
     layout     = "wide"
 )
 
-FASTAPI_URL = "https://reddit-news-api.onrender.com"
+FASTAPI_URL = "https://reddit-news-backend.onrender.com"
 
 st.title("Reddit News Recommendation System")
 st.markdown("*Powered by TF-IDF + SVD + Reddit Hot Algorithm + Real Time News*")
