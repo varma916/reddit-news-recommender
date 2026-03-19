@@ -1,6 +1,5 @@
-# main.py — FastAPI Backend
-# Optimized for Render free tier
-# Computes similarity on demand instead of loading full matrix
+# main.py - FastAPI Backend
+# Real Time News using NewsData.io + GNews API
 
 import os
 import pickle
@@ -14,30 +13,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from sklearn.metrics.pairwise import cosine_similarity
+from datetime import datetime, timezone
 
-# ── Load saved models ─────────────────────────────────────────
+# ── Load Models ───────────────────────────────────────────────
 MODEL_PATH = os.path.dirname(os.path.abspath(__file__))
 
 def load_models():
     global df, tfidf_matrix, svd_matrix
     print("Loading models...")
     try:
-        df          = pd.read_pickle(
+        df           = pd.read_pickle(
             os.path.join(MODEL_PATH, 'df.pkl'))
         tfidf_matrix = sp.load_npz(
             os.path.join(MODEL_PATH, 'tfidf_matrix.npz'))
-        svd_matrix  = np.load(
+        svd_matrix   = np.load(
             os.path.join(MODEL_PATH, 'svd_matrix.npy'))
         print("✅ Models loaded successfully!")
-
     except Exception as e:
         print(f"Models not found: {e}")
-        print("Running save_model.py...")
         subprocess.run(
             ['python',
              os.path.join(MODEL_PATH, 'save_model.py')],
-            check=True
-        )
+            check=True)
         df           = pd.read_pickle(
             os.path.join(MODEL_PATH, 'df.pkl'))
         tfidf_matrix = sp.load_npz(
@@ -48,14 +45,15 @@ def load_models():
 
 load_models()
 
-# ── Load API Key ──────────────────────────────────────────────
-NEWS_API_KEY = os.getenv('NEWS_API_KEY', '')
+# ── API Keys ──────────────────────────────────────────────────
+NEWSDATA_API_KEY = os.getenv('NEWSDATA_API_KEY', '')
+GNEWS_API_KEY    = os.getenv('GNEWS_API_KEY', '')
 
 # ── FastAPI App ───────────────────────────────────────────────
 app = FastAPI(
     title       = "Reddit News Recommendation API",
-    description = "Recommends news using TF-IDF, SVD, Hybrid and Live News",
-    version     = "2.0"
+    description = "Real time news using NewsData.io + GNews + TF-IDF + SVD",
+    version     = "3.0"
 )
 
 app.add_middleware(
@@ -74,7 +72,180 @@ class RecommendRequest(BaseModel):
     subreddit  : Optional[str] = None
 
 
-# ── Helper Functions ──────────────────────────────────────────
+# ── Format Time Ago ───────────────────────────────────────────
+def time_ago(published_str):
+    try:
+        if not published_str:
+            return ""
+        published_str = published_str.replace('Z', '+00:00')
+        published     = datetime.fromisoformat(published_str)
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        now  = datetime.now(timezone.utc)
+        diff = now - published
+        secs = int(diff.total_seconds())
+        if secs < 60:
+            return f"{secs} seconds ago"
+        elif secs < 3600:
+            return f"{secs // 60} minutes ago"
+        elif secs < 86400:
+            return f"{secs // 3600} hours ago"
+        else:
+            return f"{secs // 86400} days ago"
+    except:
+        return published_str
+
+
+# ── NewsData.io API (Primary) ─────────────────────────────────
+def get_newsdata(query=None, category=None, top_n=10):
+    if not NEWSDATA_API_KEY:
+        return []
+    try:
+        params = {
+            'apikey'  : NEWSDATA_API_KEY,
+            'language': 'en',
+            'size'    : min(top_n, 10)
+        }
+        if query:
+            params['q'] = query
+        if category:
+            cat_map = {
+                'business'     : 'business',
+                'technology'   : 'technology',
+                'health'       : 'health',
+                'sports'       : 'sports',
+                'entertainment': 'entertainment',
+                'science'      : 'science',
+                'general'      : 'top'
+            }
+            params['category'] = cat_map.get(
+                category, 'top')
+
+        url      = "https://newsdata.io/api/1/latest"
+        response = req.get(url, params=params, timeout=10)
+
+        if response.status_code != 200:
+            print(f"NewsData error: {response.status_code}")
+            return []
+
+        data     = response.json()
+        articles = []
+
+        for item in data.get('results', []):
+            published = item.get('pubDate', '')
+            articles.append({
+                'title'      : item.get('title', ''),
+                'description': item.get(
+                    'description', '') or '',
+                'url'        : item.get('link', ''),
+                'source'     : item.get('source_name', ''),
+                'published'  : published,
+                'time_ago'   : time_ago(published),
+                'image'      : item.get('image_url', '') or '',
+                'category'   : ', '.join(
+                    item.get('category', ['general'])),
+                'subreddit'  : category or 'general',
+                'score_val'  : 1.0,
+                'method'     : 'Live News (NewsData.io)',
+                'api_source' : 'newsdata'
+            })
+
+        return articles
+
+    except Exception as e:
+        print(f"NewsData.io error: {e}")
+        return []
+
+
+# ── GNews API (Backup) ────────────────────────────────────────
+def get_gnews(query=None, category=None, top_n=10):
+    if not GNEWS_API_KEY:
+        return []
+    try:
+        if query:
+            url    = "https://gnews.io/api/v4/search"
+            params = {
+                'q'     : query,
+                'lang'  : 'en',
+                'max'   : min(top_n, 10),
+                'sortby': 'publishedAt',
+                'apikey': GNEWS_API_KEY
+            }
+        else:
+            url       = "https://gnews.io/api/v4/top-headlines"
+            topic_map = {
+                'business'     : 'business',
+                'technology'   : 'technology',
+                'health'       : 'health',
+                'sports'       : 'sports',
+                'entertainment': 'entertainment',
+                'science'      : 'science',
+                'general'      : 'breaking-news'
+            }
+            params = {
+                'lang'  : 'en',
+                'max'   : min(top_n, 10),
+                'apikey': GNEWS_API_KEY
+            }
+            if category:
+                params['topic'] = topic_map.get(
+                    category, 'breaking-news')
+
+        response = req.get(url, params=params, timeout=10)
+
+        if response.status_code != 200:
+            print(f"GNews error: {response.status_code}")
+            return []
+
+        data     = response.json()
+        articles = []
+
+        for item in data.get('articles', []):
+            published = item.get('publishedAt', '')
+            articles.append({
+                'title'      : item.get('title', ''),
+                'description': item.get(
+                    'description', '') or '',
+                'url'        : item.get('url', ''),
+                'source'     : item.get(
+                    'source', {}).get('name', ''),
+                'published'  : published,
+                'time_ago'   : time_ago(published),
+                'image'      : item.get('image', '') or '',
+                'category'   : category or 'general',
+                'subreddit'  : category or 'general',
+                'score_val'  : 1.0,
+                'method'     : 'Live News (GNews)',
+                'api_source' : 'gnews'
+            })
+
+        return articles
+
+    except Exception as e:
+        print(f"GNews error: {e}")
+        return []
+
+
+# ── Smart Live News ───────────────────────────────────────────
+def get_live_news(query=None, category=None, top_n=10):
+    # Try NewsData.io first
+    if NEWSDATA_API_KEY:
+        results = get_newsdata(query, category, top_n)
+        if results:
+            print(f"NewsData.io: {len(results)} articles")
+            return results
+
+    # Try GNews second
+    if GNEWS_API_KEY:
+        results = get_gnews(query, category, top_n)
+        if results:
+            print(f"GNews: {len(results)} articles")
+            return results
+
+    return []
+
+
+# ── ML Recommendation Functions ───────────────────────────────
 def get_post_index(post_title):
     matches = df[df['title'].str.contains(
         post_title, case=False, na=False)]
@@ -87,14 +258,12 @@ def content_based_recommend(post_title, top_n=10):
     idx = get_post_index(post_title)
     if idx is None:
         return []
-
-    # Compute similarity only for this one query row
-    query_vec  = tfidf_matrix[idx]
-    sim_scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
-    sim_scores[idx] = 0  # remove self
+    query_vec   = tfidf_matrix[idx]
+    sim_scores  = cosine_similarity(
+        query_vec, tfidf_matrix).flatten()
+    sim_scores[idx] = 0
     top_indices = sim_scores.argsort()[::-1][:top_n]
-
-    result = df.iloc[top_indices][
+    result      = df.iloc[top_indices][
         ['title','subreddit','score','num_comments']].copy()
     result['score_val'] = sim_scores[top_indices]
     result['method']    = 'TF-IDF Content'
@@ -105,14 +274,12 @@ def svd_based_recommend(post_title, top_n=10):
     idx = get_post_index(post_title)
     if idx is None:
         return []
-
-    # Compute SVD similarity only for this one query row
-    query_vec  = svd_matrix[idx].reshape(1, -1)
-    sim_scores = cosine_similarity(query_vec, svd_matrix).flatten()
-    sim_scores[idx] = 0  # remove self
+    query_vec   = svd_matrix[idx].reshape(1, -1)
+    sim_scores  = cosine_similarity(
+        query_vec, svd_matrix).flatten()
+    sim_scores[idx] = 0
     top_indices = sim_scores.argsort()[::-1][:top_n]
-
-    result = df.iloc[top_indices][
+    result      = df.iloc[top_indices][
         ['title','subreddit','score','num_comments']].copy()
     result['score_val'] = sim_scores[top_indices]
     result['method']    = 'SVD'
@@ -136,96 +303,37 @@ def hybrid_recommend(post_title, top_n=10):
     idx = get_post_index(post_title)
     if idx is None:
         return []
-
-    # TF-IDF similarity
-    query_tfidf    = tfidf_matrix[idx]
-    tfidf_scores   = cosine_similarity(
-        query_tfidf, tfidf_matrix).flatten()
-    tfidf_scores[idx] = 0
-
-    # SVD similarity
-    query_svd      = svd_matrix[idx].reshape(1, -1)
-    svd_scores     = cosine_similarity(
-        query_svd, svd_matrix).flatten()
-    svd_scores[idx] = 0
-
-    # Popularity score
-    pop_scores     = df['hot_score_norm'].values
-
-    # Weighted hybrid
-    hybrid_scores  = (0.4 * tfidf_scores +
-                      0.3 * svd_scores +
-                      0.3 * pop_scores)
+    tfidf_scores       = cosine_similarity(
+        tfidf_matrix[idx], tfidf_matrix).flatten()
+    tfidf_scores[idx]  = 0
+    svd_scores         = cosine_similarity(
+        svd_matrix[idx].reshape(1, -1),
+        svd_matrix).flatten()
+    svd_scores[idx]    = 0
+    pop_scores         = df['hot_score_norm'].values
+    hybrid_scores      = (0.4 * tfidf_scores +
+                          0.3 * svd_scores +
+                          0.3 * pop_scores)
     hybrid_scores[idx] = 0
-
     top_indices = hybrid_scores.argsort()[::-1][:top_n]
-
-    result = df.iloc[top_indices][
+    result      = df.iloc[top_indices][
         ['title','subreddit','score','num_comments']].copy()
     result['score_val'] = hybrid_scores[top_indices]
     result['method']    = 'Hybrid'
     return result.to_dict('records')
 
 
-def get_live_news(query=None, category=None, top_n=10):
-    if not NEWS_API_KEY:
-        return []
-    try:
-        if query:
-            url = (
-                f"https://newsapi.org/v2/everything?"
-                f"q={query}&"
-                f"sortBy=publishedAt&"
-                f"pageSize={top_n}&"
-                f"language=en&"
-                f"apiKey={NEWS_API_KEY}"
-            )
-        else:
-            cat_param = f"&category={category}" \
-                if category else ""
-            url = (
-                f"https://newsapi.org/v2/top-headlines?"
-                f"country=us{cat_param}&"
-                f"pageSize={top_n}&"
-                f"apiKey={NEWS_API_KEY}"
-            )
-
-        response = req.get(url, timeout=10)
-        data     = response.json()
-
-        if data.get('status') != 'ok':
-            return []
-
-        articles = []
-        for article in data.get('articles', []):
-            if article.get('title') and \
-               article.get('title') != '[Removed]':
-                articles.append({
-                    'title'      : article.get('title', ''),
-                    'description': article.get('description', ''),
-                    'url'        : article.get('url', ''),
-                    'source'     : article.get(
-                        'source', {}).get('name', ''),
-                    'published'  : article.get('publishedAt', ''),
-                    'subreddit'  : category or 'general',
-                    'score'      : 0,
-                    'num_comments': 0,
-                    'score_val'  : 1.0,
-                    'method'     : 'Live News'
-                })
-        return articles
-
-    except Exception as e:
-        print(f"NewsAPI error: {e}")
-        return []
-
-
 # ── API Routes ────────────────────────────────────────────────
 @app.get("/")
 def home():
+    apis = []
+    if NEWSDATA_API_KEY:
+        apis.append("NewsData.io")
+    if GNEWS_API_KEY:
+        apis.append("GNews")
     return {
-        "message"  : "Reddit News Recommendation API is running!",
-        "version"  : "2.0 — Now with Live News!",
+        "message"  : "Reddit News Recommendation API v3.0!",
+        "live_news": apis,
         "endpoints": ["/recommend", "/categories",
                       "/popular", "/stats",
                       "/live-news", "/live-search"]
@@ -247,7 +355,6 @@ def get_recommendations(request: RecommendRequest):
     else:
         results = hybrid_recommend(
             request.post_title, request.top_n)
-
     return {
         "method"         : method,
         "query"          : request.post_title,
@@ -259,22 +366,26 @@ def get_recommendations(request: RecommendRequest):
 @app.get("/live-news")
 def live_news(category: Optional[str] = None,
               top_n: int = 10):
-    results = get_live_news(category=category, top_n=top_n)
+    results  = get_live_news(category=category, top_n=top_n)
+    api_used = results[0].get(
+        'api_source', 'unknown') if results else 'none'
     return {
         "category"     : category or "general",
         "total_results": len(results),
-        "source"       : "NewsAPI — Live",
+        "api_used"     : api_used,
         "articles"     : results
     }
 
 
 @app.get("/live-search")
 def live_search(query: str, top_n: int = 10):
-    results = get_live_news(query=query, top_n=top_n)
+    results  = get_live_news(query=query, top_n=top_n)
+    api_used = results[0].get(
+        'api_source', 'unknown') if results else 'none'
     return {
         "query"        : query,
         "total_results": len(results),
-        "source"       : "NewsAPI — Live",
+        "api_used"     : api_used,
         "articles"     : results
     }
 
@@ -298,11 +409,16 @@ def get_popular(subreddit: Optional[str] = None,
 
 @app.get("/stats")
 def get_stats():
+    apis = []
+    if NEWSDATA_API_KEY:
+        apis.append("NewsData.io")
+    if GNEWS_API_KEY:
+        apis.append("GNews")
     return {
         "total_posts" : len(df),
         "categories"  : df['subreddit'].nunique(),
         "avg_score"   : round(df['score'].mean(), 2),
         "avg_comments": round(df['num_comments'].mean(), 2),
-        "live_news"   : "✅ Enabled"
-                        if NEWS_API_KEY else "❌ No API Key"
+        "live_news"   : " + ".join(apis) if apis
+                        else "Not configured"
     }
